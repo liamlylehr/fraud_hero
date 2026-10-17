@@ -2,29 +2,32 @@
 
 Forward a suspicious email to one address and find out whether it's a scam.
 
-**Current step:** emails sent to the service address are received by Amazon SES and stored, unchanged, in S3. Nothing reads or answers them yet.
+**Current step:** emails sent to the service address are received by Amazon SES, stored unchanged in S3, and queued for processing. The processor (`hero_lambda`) only logs which email arrived. It doesn't read or answer anything yet.
 
 ```
-sender --> MX (Vercel DNS) --> SES (us-east-1) --> S3 bucket, inbound/
+sender --> MX (Vercel DNS) --> SES (us-east-1) --> S3 inbound/ --> SQS --> hero_lambda (logs arrival)
+                                                                    |
+                                                                    +--> dead-letter queue after 3 failures
 ```
 
 - `infra/`: TypeScript CDK app (`lib/fraud-hero-stack.ts` is the whole stack)
+- `hero_lambda/`: the Python processor (`handler.py`, standard library only)
 - `openspec/`: the plan, specs and design for each step
 
 ## Setup
 
-Requires Node 22+ and, for deploying, the AWS CLI with credentials for your account.
+Requires Node 22+, Python 3.12+ with [uv](https://docs.astral.sh/uv/), and the AWS CLI. The `Makefile` uses the AWS profile `fraud-hero` (override with `make <target> AWS_PROFILE=...`).
 
 ```bash
-cd infra
-npm install
-npm test
-npx cdk synth
+make install   # npm install + uv sync
+make test      # infra and hero_lambda tests
+make synth
+make help      # all targets
 ```
 
 ## Configuration
 
-Set these in `infra/cdk.json` under `context` (the committed values are placeholders):
+Set these in `infra/cdk.json` under `context`:
 
 | Key | Example | What it is |
 |---|---|---|
@@ -36,14 +39,15 @@ The region is fixed to `us-east-1`, one of the regions where SES can receive mai
 ## Deploy
 
 ```bash
-cd infra
-npx cdk bootstrap aws://<account-id>/us-east-1   # once per account and region
-npx cdk deploy
+make login       # browser sign-in for the fraud-hero profile
+make bootstrap   # once per account and region
+make deploy
 ```
 
-The deploy prints `BucketName` and three DKIM records (`DkimRecord1Name` / `DkimRecord1Value` … `3`). To see them again later:
+The deploy prints the stack outputs: `BucketName`, `QueueUrl`, `DeadLetterQueueUrl`, and three DKIM records (`DkimRecord1Name` / `DkimRecord1Value` … `3`). The raw `aws` commands below assume the profile is set:
 
 ```bash
+export AWS_PROFILE=fraud-hero
 aws cloudformation describe-stacks --stack-name FraudHero --region us-east-1 \
   --query "Stacks[0].Outputs" --output table
 ```
@@ -84,28 +88,55 @@ vercel dns add yourdomain.com abc123._domainkey.fraud CNAME abc123.dkim.amazonse
    aws ses describe-active-receipt-rule-set --region us-east-1   # empty output = none active
    ```
 
-3. Activate ours. This is a one-time step that CDK can't do.
+3. Activate ours. This is a one-time step that CDK can't do. **The `--rule-set-name` is required**: the same command without it *deactivates* receiving.
 
    ```bash
    aws ses set-active-receipt-rule-set --rule-set-name fraud-hero --region us-east-1
    ```
 
-## Watching mail land
+## Watching the pipeline
 
-Send an email to the service address, then:
+Load the names once per shell:
 
 ```bash
-BUCKET=<BucketName from the outputs>
+output() { aws cloudformation describe-stacks --stack-name FraudHero --region us-east-1 \
+  --query "Stacks[0].Outputs[?OutputKey=='$1'].OutputValue" --output text; }
+BUCKET=$(output BucketName); QUEUE=$(output QueueUrl); DLQ=$(output DeadLetterQueueUrl)
+LOGS=$(aws logs describe-log-groups --region us-east-1 --log-group-name-prefix FraudHero-HeroLambdaLogs \
+  --query "logGroups[0].logGroupName" --output text)
+```
+
+**Mail landing in S3:** each object is the full raw email. The `X-SES-Spam-Verdict` / `X-SES-Virus-Verdict` headers show SES's scan results. Mail to other addresses on the subdomain isn't stored, and stored mail is deleted after 30 days.
+
+```bash
 aws s3 ls "s3://$BUCKET/inbound/" --region us-east-1
 aws s3 cp "s3://$BUCKET/inbound/<object-key>" - --region us-east-1 | head -40   # raw message
 ```
 
-Each object is the full raw email. The `X-SES-Spam-Verdict` and `X-SES-Virus-Verdict` headers show SES's scan results. Mail to any other address on the subdomain is not stored, and stored mail is deleted after 30 days.
+**hero_lambda logs:** one `{"event": "received", "bucket": ..., "key": ...}` line per email.
+
+```bash
+aws logs tail "$LOGS" --region us-east-1 --follow
+```
+
+**Queue and dead-letter queue depth:**
+
+```bash
+for q in "$QUEUE" "$DLQ"; do aws sqs get-queue-attributes --queue-url "$q" --region us-east-1 \
+  --attribute-names ApproximateNumberOfMessages ApproximateNumberOfMessagesNotVisible --output text; done
+```
+
+**Testing the dead-letter queue:** send a message that isn't an S3 event. `hero_lambda` fails on it 3 times (one attempt every ~3 minutes), then it appears in the DLQ. Purge it afterwards.
+
+```bash
+aws sqs send-message --queue-url "$QUEUE" --message-body "not an s3 event" --region us-east-1
+aws sqs purge-queue --queue-url "$DLQ" --region us-east-1
+```
 
 ## Rollback
 
 ```bash
-aws ses set-active-receipt-rule-set --region us-east-1   # no name = deactivate
+aws ses set-active-receipt-rule-set --region us-east-1   # no name = deactivate receiving
 cd infra && npx cdk destroy
 ```
 

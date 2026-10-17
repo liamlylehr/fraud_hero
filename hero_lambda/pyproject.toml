@@ -1,0 +1,12 @@
+# Dev tooling only. The Lambda itself uses just the standard library, so nothing here is deployed.
+[project]
+name = "fraud-hero-hero-lambda"
+version = "0.1.0"
+requires-python = ">=3.12"
+
+[dependency-groups]
+dev = ["pytest"]
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
+testpaths = ["tests"]
